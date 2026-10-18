@@ -54,7 +54,7 @@ async function convert(source, target, httpBodies = {}, sourceType = 'loon-plugi
       doneValue = value
     },
     $argument: runtime.argument || '',
-    $environment: { 'surge-version': 'test' },
+    $environment: runtime.environment || { 'surge-version': 'test' },
     $persistentStore: {
       read: key => runtime.store?.[key] ?? null,
       write: () => true,
@@ -80,6 +80,10 @@ async function convert(source, target, httpBodies = {}, sourceType = 'loon-plugi
   return { body, notifications, logs }
 }
 
+async function convertNative(source, target, httpBodies = {}, sourceType = 'loon-plugin', queryParams = {}, runtime = {}) {
+  return convert(source, target, httpBodies, sourceType, queryParams, { environment: { 'stash-version': '3.7.0', system: 'iOS' }, ...runtime })
+}
+
 function sectionLines(body, sectionName) {
   const headers = ['[Rule]', '[Rewrite]', '[Script]', '[Body Rewrite]', '[Header Rewrite]', '[Map Local]', '[MITM]']
   const header = `[${sectionName}]`
@@ -95,6 +99,164 @@ function sectionLines(body, sectionName) {
     .map(line => line.trim())
     .filter(line => line && !line.startsWith('#'))
 }
+
+function stashDocument(body, custom = {}) {
+  const { execFileSync } = require('node:child_process')
+  const document = JSON.parse(execFileSync('ruby', ['-ryaml', '-rjson', '-e', 'puts JSON.generate(YAML.safe_load(STDIN.read, permitted_classes: [Time], aliases: true))'], { input: body, encoding: 'utf8' }))
+  if (document['arguments-version'] !== 1) return document
+  const values = Object.fromEntries(Object.entries(document.arguments || {}).map(([key, schema]) => [key, schema.default]))
+  Object.assign(values, custom)
+  const expand = value => {
+    if (typeof value === 'string') return value.replace(/(\$?)\$\{args\.([A-Za-z][A-Za-z0-9_]*)(\|json)?\}/g, (all, escaped, key, json) => escaped ? all.slice(1) : json ? JSON.stringify(values[key]) : String(values[key]))
+    if (Array.isArray(value)) return value.map(expand)
+    if (value && typeof value === 'object') return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, ['arguments', 'name', 'desc'].includes(key) ? item : expand(item)]))
+    return value
+  }
+  return expand(document)
+}
+
+test('Stash native arguments require a supported host version and platform, independent of download UA', async () => {
+  const source = '[Argument]\nword=input,hello\nschedule=input,0 1 * * *\n[Script]\nhttp-request /text/ script-path=https://example.com/text.js,argument={word}\ncron {schedule} script-path=https://example.com/cron.js'
+  const cases = [
+    [{ 'stash-version': '3.6.9', system: 'iOS' }, false],
+    [{ 'stash-version': '3.7', system: 'iOS' }, true],
+    [{ 'stash-version': '3.10.0', system: 'iOS' }, true],
+    [{ 'stash-version': '3.7.0-beta.1', system: 'tvOS' }, true],
+    [{ 'stash-version': '4.3.9', system: 'macOS' }, false],
+    [{ 'stash-version': '4.4.0', system: 'macOS' }, true],
+    [{ 'stash-version': '4.10.0', system: 'macOS' }, true],
+    [{ 'stash-version': '3.7.0', system: 'macOS' }, false],
+    [{ 'stash-version': '9.0.0' }, false],
+    [{ 'stash-version': '9.0.0', system: 'unknown' }, false],
+    [{ system: 'iOS' }, false],
+    [{ 'stash-version': 'invalid', system: 'iOS' }, false],
+    [{ 'stash-version': '3.6oops', system: 'iOS' }, false],
+    [{ 'surge-version': '9.0', system: 'iOS' }, false],
+  ]
+  for (const [environment, native] of cases) {
+    const { body } = await convert(source, 'stash-stoverride', {}, 'loon-plugin', { headers: 'User-Agent: Loon/3.3.0' }, { environment })
+    assert.equal(body.includes('arguments-version: 1'), native, JSON.stringify(environment))
+    const doc = stashDocument(body)
+    assert.equal(doc.http.script[0].argument, 'hello')
+    assert.equal(doc.cron.script[0].cron, '0 1 * * *')
+    if (!native) assert.doesNotMatch(body, /\$\{args\.|arguments-version:|\narguments:/)
+  }
+})
+
+test('old and unknown Stash hosts preserve typed object and JSON string consumers and literal dollars', async () => {
+  const converter = fs.readFileSync(path.join(__dirname, '..', 'script-converter.beta.js'), 'utf8')
+  for (const environment of [{}, { 'stash-version': '3.6.9', system: 'iOS' }, { 'stash-version': '4.3.9', system: 'macOS' }]) {
+    for (const syntax of ['legacy', 'v2']) {
+      const source = '[Argument]\nflag=switch,false\nliteral=select,"false","true"\ncount=input,9.5,type=number\nword=input,"中文\\\"\\\\${args.literal}"\n[Script]\n' + (syntax === 'legacy'
+        ? 'http-request /object/ script-path=https://example.com/consumer.js,argument=[{flag},{literal},{count},{word}]'
+        : 'request if ${url} ~= /object/ then script("https://example.com/consumer.js", {${flag},${literal},${count},${word}})')
+      const { body } = await convert(source, 'stash-stoverride', {}, 'loon-plugin', {}, { environment })
+      assert.doesNotMatch(body, /arguments-version:|\narguments:|\$\$\{args\./)
+      const doc = stashDocument(body)
+      const argument = doc.http.script[0].argument
+      assert.deepEqual(JSON.parse(argument), { flag: false, literal: 'false', count: 9.5, word: '中文"\\${args.literal}' })
+      const provider = Object.values(doc['script-providers'])[0].url
+      const wrapped = await convert('', '', { 'https://example.com/consumer.js': '$done({body:JSON.stringify($argument)})' }, 'loon-plugin', {}, { parser: converter, requestUrl: provider, environment })
+      let result
+      vm.runInNewContext(wrapped.body, { $argument: argument, $done: value => { result = value } })
+      assert.deepEqual(JSON.parse(result.body), JSON.parse(argument))
+    }
+    const json = '{"{word}":"prefix-{word}-{other}","literal":"${args.word}","bool":{flag},"number":{count}}'
+    const source = '[Argument]\nword=input,hello\nother=input,world\nflag=switch,false\ncount=input,9.5,type=number\n[Script]\nhttp-request /json/ script-path=https://example.com/consumer.js,argument=' + JSON.stringify(json)
+    const { body } = await convert(source, 'stash-stoverride', {}, 'loon-plugin', {}, { environment })
+    const doc = stashDocument(body)
+    const provider = Object.values(doc['script-providers'])[0].url
+    const wrapped = await convert('', '', { 'https://example.com/consumer.js': 'if(typeof $argument!=="string")throw Error("string contract");$done({body:$argument})' }, 'loon-plugin', {}, { parser: converter, requestUrl: provider, environment })
+    let result
+    vm.runInNewContext(wrapped.body, { $argument: doc.http.script[0].argument, $done: value => { result = value } })
+    assert.deepEqual(JSON.parse(result.body), { '{word}': 'prefix-hello-world', literal: '${args.word}', bool: false, number: 9.5 })
+    assert.doesNotMatch(body, /arguments-version:|\$\$\{args\./)
+  }
+})
+
+test('Stash native argument schemas and custom values reach the generated wrapper', async () => {
+  for (const syntax of ['legacy', 'v2']) {
+    const keys = ['spot-ev3-enable', 'spot_ev3_enable', 'arg_spot_ev3_enable', 'a-b', 'a.b', '1name', '任意.key', 'a'.repeat(65), 'a'.repeat(64)]
+    const source = '[Argument]\nflag=switch,false\nliteral=select,"false","true"\ncount=input,9,type=number\nratio=input,9.5,type=number\n' + keys.map(key => `${key}=input,"default",tag="Title",desc="Detail"`).join('\n') + '\n[Script]\n' + (syntax === 'legacy'
+      ? `http-request /object/ script-path=https://example.com/native.js,argument=[{flag},{literal},{count},{ratio},${keys.map(key => `{${key}}`).join(',')}]`
+      : 'request if ${url} ~= /object/ then script("https://example.com/native.js", {' + ['flag','literal','count','ratio',...keys].map(key => '${' + key + '}').join(',') + '})')
+    const { body } = await convertNative(source, 'stash-stoverride')
+    assert.match(body, /arguments-version: 1/)
+    const defaults = stashDocument(body)
+    const names = Object.keys(defaults.arguments)
+    assert.equal(names.length, keys.length + 4)
+    names.forEach(key => assert.match(key, /^[A-Za-z][A-Za-z0-9_]{0,63}$/))
+    assert.equal(defaults.arguments.count['value-type'], 'integer')
+    assert.equal(defaults.arguments.ratio.default, '9.5')
+    const custom = { flag: true, literal: 'false', count: 42, ratio: '2.75' }
+    names.filter(key => !Object.hasOwn(custom, key)).forEach(key => { custom[key] = '中文"\\\n{}$${args.flag}{flag}' })
+    const converter = fs.readFileSync(path.join(__dirname, '..', 'script-converter.beta.js'), 'utf8')
+    for (const selected of [{}, custom]) {
+      const generated = stashDocument(body, selected)
+      const provider = Object.values(generated['script-providers'])[0].url
+      const wrapped = await convertNative('', '', { 'https://example.com/native.js': '$done({body: JSON.stringify($argument)})' }, 'loon-plugin', {}, { parser: converter, requestUrl: provider })
+      let result
+      vm.runInNewContext(wrapped.body, { $argument: generated.http.script[0].argument, $done: value => { result = value } })
+      if (selected.flag) assert.throws(() => vm.runInNewContext(wrapped.body, { $argument: JSON.stringify({ ...JSON.parse(generated.http.script[0].argument), ratio: 'invalid' }), $done: () => assert.fail('invalid number reached consumer') }), /Invalid numeric argument/)
+      const actual = JSON.parse(result.body)
+      assert.equal(actual.flag, selected.flag ?? false)
+      assert.equal(actual.literal, 'false')
+      assert.equal(actual.count, selected.count ?? 9)
+      assert.equal(actual.ratio, selected.ratio ? 2.75 : 9.5)
+      keys.forEach(key => assert.equal(actual[key], selected.flag ? '中文"\\\n{}$${args.flag}{flag}' : 'default'))
+    }
+  }
+})
+
+test('Stash native string and JSON string arguments preserve their contracts and escape literal references', async () => {
+  const source = '#!arguments=word:"false",flag:false\n[Script]\nhttp-request /text/ script-path=https://example.com/text.js,argument="word={{{word}}}&literal=${args.word}"\nhttp-request /json/ script-path=https://example.com/json.js,argument="{\\"word\\":\\"{{{word}}}\\",\\"flag\\":{{{flag}}}}"'
+  const { body } = await convertNative(source, 'stash-stoverride', {}, 'surge-module')
+  assert.match(body, /\$\{args.word\|json\}/)
+  const selected = '引号"\\\n{}$${args.flag}'
+  const generated = stashDocument(body, { word: selected })
+  assert.equal(generated.http.script[0].argument, `word=${selected}&literal=\${args.word}`)
+  assert.deepEqual(JSON.parse(generated.http.script[1].argument), { word: selected, flag: false })
+  assert.doesNotMatch(body, /argumentFormat=loon-object/)
+  const converter = fs.readFileSync(path.join(__dirname, '..', 'script-converter.beta.js'), 'utf8')
+  const provider = 'http://script.hub/convert/_start_/https://example.com/text.js/_end_/text.js?type=loon-script&target=stash-script'
+  const wrapped = await convertNative('', '', { 'https://example.com/text.js': 'if (typeof $argument !== "string") throw new Error("string contract lost"); $done({body: $argument})' }, 'loon-plugin', {}, { parser: converter, requestUrl: provider })
+  let result
+  vm.runInNewContext(wrapped.body, { $argument: generated.http.script[0].argument, $done: value => { result = value } })
+  assert.equal(result.body, generated.http.script[0].argument)
+})
+
+test('Stash only declares active argument consumers and explains static enable for shared switches', async () => {
+  const { body } = await convertNative('[Argument]\nonlyGate=switch,true\nshared=switch,true\nunused=input,"metadata"\noff=switch,false\n[Script]\nhttp-request /gate/ script-path=https://example.com/gate.js,enable={onlyGate}\nhttp-request /shared/ script-path=https://example.com/shared.js,enable={shared},argument=[{shared}]\nhttp-request /off/ script-path=https://example.com/off.js,enable={off},argument=[{unused}]', 'stash-stoverride')
+  const doc = stashDocument(body)
+  assert.deepEqual(Object.keys(doc.arguments), ['shared'])
+  const mock = await convertNative('[Argument]\nflag=input,changed\n[Script]\nhttp-request /text/ script-path=https://example.com/text.js,argument=prefix-{flag}\n[Rewrite]\nresponse if ${url} ~= /mock/ then response.body.mock("text", "{flag}", 201)', 'stash-stoverride')
+  assert.match(decodeURIComponent(decodeURIComponent(stashDocument(mock.body).http.script[1].argument)), /text=\{flag\}/)
+  assert.match(mock.body, /prefix-\$\{args.flag\}/)
+  assert.match(doc.arguments.shared.description, /enable.*静态/)
+  assert.doesNotMatch(body, /\n\s+enabled:/)
+})
+
+test('Stash JSON string interpolation preserves keys, multiple values, and the string consumer contract', async () => {
+  const json = '{"{word}":"prefix-{word}-{other}","literal":"${args.word}","whole":"{word}","bool":"{flag}","nested":["x{other}"]}'
+  const source = '[Argument]\nword=input,hello\nother=input,world\nflag=switch,false\n[Script]\nhttp-request /json/ script-path=https://example.com/interpolate.js,argument=' + JSON.stringify(json)
+  const { body } = await convertNative(source, 'stash-stoverride')
+  assert.match(body, /arguments-version: 1/)
+  const converter = fs.readFileSync(path.join(__dirname, '..', 'script-converter.beta.js'), 'utf8')
+  for (const custom of [{}, { word: '中文"\\\n${args.other}{other}', other: 'second"\n' }]) {
+    const generated = stashDocument(body, custom)
+    const provider = Object.values(generated['script-providers'])[0].url
+    const wrapped = await convertNative('', '', { 'https://example.com/interpolate.js': 'if(typeof $argument !== "string") throw new Error("string contract"); $done({body:$argument})' }, 'loon-plugin', {}, { parser: converter, requestUrl: provider })
+    let result
+    vm.runInNewContext(wrapped.body, { $argument: generated.http.script[0].argument, $done: value => { result = value } })
+    assert.deepEqual(JSON.parse(result.body), { '{word}': `prefix-${custom.word ?? 'hello'}-${custom.other ?? 'world'}`, literal: '${args.word}', whole: custom.word ?? 'hello', bool: false, nested: ['x' + (custom.other ?? 'world')] })
+  }
+})
+
+test('Stash active references to commented declarations use defaults while unknown references survive', async () => {
+  const { body } = await convert('[Argument]\n#word=input,hello\n[Script]\nhttp-request /text/ script-path=https://example.com/text.js,argument=prefix-{word}-{undefined}', 'stash-stoverride', {}, 'loon-plugin', { del: 'false' })
+  assert.equal(stashDocument(body).http.script[0].argument, 'prefix-hello-{undefined}')
+  assert.doesNotMatch(body, /arguments-version:/)
+})
 
 test('redirect candidates reject prose while retaining commented rules and keyword controls', async () => {
   const source = '# The default header entry does not pass full to avoid reading the body by mistake.\n#^https://example.com/old https://example.com/new 302\n^https://example.com/live url 307 https://example.com/next'
@@ -134,17 +296,17 @@ test('Stash resolves legacy and v2 enable using Boolean defaults and disables un
 
 test('legacy Loon argument lists reuse typed object wrappers and preserve native strings', async () => {
   const source = '[Argument]\nflag=switch,false\nliteral=select,"false","true"\ncount=input,9.5,type=number\n[Script]\nhttp-request /object/ script-path=https://example.com/shared.js,argument=[{flag},{literal},{count}]\nhttp-request /plain/ script-path=https://example.com/shared.js,argument="native string"'
-  const { body } = await convert(source, 'stash-stoverride')
+  const { body } = await convertNative(source, 'stash-stoverride')
   assert.match(body, /argumentFormat=loon-object/)
-  assert.match(body, /\{"flag":false,"literal":"false","count":9.5\}/)
+  assert.deepEqual(JSON.parse(stashDocument(body).http.script[0].argument), { flag: false, literal: 'false', count: '9.5' })
   assert.match(body, /argument: \|-\n\s+native string/)
   assert.equal((body.match(/url: https:\/\/example.com\/shared.js/g) || []).length, 1)
   assert.equal(new Set([...body.matchAll(/name: "([^"]+)"/g)].map(m => m[1])).size, 2)
   const providerUrl = body.match(/url: (http:\/\/script\.hub\/convert\/[^\n]+)/)[1].trim()
   const converter = fs.readFileSync(path.join(__dirname, '..', 'script-converter.beta.js'), 'utf8')
-  const wrapped = await convert('', '', { 'https://example.com/shared.js': '$done({body: JSON.stringify($argument)})' }, 'loon-plugin', {}, { parser: converter, requestUrl: providerUrl })
+  const wrapped = await convertNative('', '', { 'https://example.com/shared.js': '$done({body: JSON.stringify($argument)})' }, 'loon-plugin', {}, { parser: converter, requestUrl: providerUrl })
   let result
-  vm.runInNewContext(wrapped.body, { $argument: body.match(/argument: \|-\n\s+([^\n]+)/)[1], $done: value => { result = value } })
+  vm.runInNewContext(wrapped.body, { $argument: stashDocument(body).http.script[0].argument, $done: value => { result = value } })
   assert.deepEqual(JSON.parse(result.body), { flag: false, literal: 'false', count: 9.5 })
 })
 
@@ -202,7 +364,7 @@ test('Stash Map Local preserves exact status, escaped text, and remote URLs in e
   const source = entries.map(([action], i) => `${action.startsWith('response.') ? 'response' : 'request'} if \${url} ~= /mock${i}/ then ${action}`).join('\n')
   const { body, notifications } = await convert(source, 'stash-stoverride')
   assert.doesNotMatch(JSON.stringify(notifications), /不支持以下内容/)
-  const args = [...body.matchAll(/argument: \|-\n\s+([^\n]+)/g)].map(match => match[1])
+  const args = stashDocument(body).http.script.map(item => item.argument)
   assert.equal(args.length, entries.length)
   const echo = fs.readFileSync(path.join(__dirname, '..', 'scripts', 'echo-response.js'), 'utf8')
   for (let i = 0; i < entries.length; i++) {
@@ -297,7 +459,7 @@ test('body regex arguments preserve commas, quotes, classes, escapes, and paired
 test('real Tieba object argument retains its key and enables the downstream video option', async () => {
   const source = fs.readFileSync(path.join(__dirname, 'fixtures', 'tieba_remove_ads.lpx'), 'utf8')
   const stash = await convert(source, 'stash-stoverride')
-  const argument = [...stash.body.matchAll(/argument: \|-\n\s+([^\n]+)/g)].map(match => match[1]).find(value => value.startsWith('{"per_filter_video_thread"'))
+  const argument = stashDocument(stash.body).http.script.map(item => item.argument).find(value => value?.startsWith('{"per_filter_video_thread"'))
   const options = JSON.parse(argument)
   assert.equal(options.per_filter_video_thread, 'true')
   assert.match(stash.body, /argumentFormat=loon-object/)
@@ -320,7 +482,7 @@ test('Stash encodes object defaults without changing literal string arguments', 
     'request if ${url} ~= /literal/ then script("https://example.com/literal.js", "first=literal&second=x")',
   ].join('\n')
   const { body, notifications } = await convert(source, 'stash-stoverride')
-  const args = [...body.matchAll(/argument: \|-\n\s+([^\n]+)/g)].map(match => match[1])
+  const args = stashDocument(body).http.script.map(item => item.argument)
   assert.deepEqual(JSON.parse(args[0]), { first: 'a&b=c%20, d', second: '引号"/空 格' })
   assert.equal(args[1], 'first=literal&second=x')
   assert.doesNotMatch(JSON.stringify(notifications), /不支持以下内容/)
@@ -339,7 +501,7 @@ test('Stash restores typed Loon objects through the converter without putting va
     'request if ${url} ~= /object/ then script("https://example.com/object.js", {${token}, ${flag}, ${count}, ${literal}, ${__proto__}, ${任意.key}})',
   ].join('\n')
   const { body } = await convert(source, 'stash-stoverride')
-  const argument = body.match(/argument: \|-\n\s+([^\n]+)/)[1]
+  const argument = stashDocument(body).http.script[0].argument
   const providerUrl = body.match(/url: (http:\/\/script\.hub\/convert\/[^\n]+)/)[1].trim()
   assert.ok(!providerUrl.includes('a&b') && !providerUrl.includes('token'))
   const converter = fs.readFileSync(path.join(__dirname, '..', 'script-converter.beta.js'), 'utf8')

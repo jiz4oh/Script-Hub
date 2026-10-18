@@ -360,8 +360,23 @@ global.$done = _scriptSonverterDone
   if (evUrlori) {
     eval($.lodash_get(await http(evUrlori, { ...reqHeaders }), 'body'))
   }
+  if (queryObject.argumentFormat === 'json-string') {
+    body = `$argument = JSON.parse($argument).map(part => {
+  if (!Array.isArray(part)) return part;
+  const [type, ...values] = part;
+  return JSON.stringify(type === 'string' ? values.join('') : values[1]);
+}).join('');\n${body}`
+  }
   if (queryObject.argumentFormat === 'loon-object') {
-    body = `$argument = JSON.parse($argument);\n${body}`
+    const numericKeys = queryObject.argumentNumbers ? JSON.parse(queryObject.argumentNumbers) : []
+    if (!Array.isArray(numericKeys) || numericKeys.some(key => typeof key !== 'string')) throw new Error('Invalid argumentNumbers')
+    const restoreNumbers = numericKeys.length ? `
+for (const key of ${JSON.stringify(numericKeys)}) {
+  const value = $argument[key];
+  if (typeof value !== 'string' || !value.trim() || !Number.isFinite(Number(value))) throw new Error('Invalid numeric argument: ' + key);
+  $argument[key] = Number(value);
+}` : ''
+    body = `$argument = JSON.parse($argument);${restoreNumbers}\n${body}`
   }
   if (type === 'qx-script' || compatibilityOnly) {
     const content = `${prefix}\n${compatibilityOnly ? body : body.replace(/\$done\(/g, '_scriptSonverterDone(')}`

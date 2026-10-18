@@ -46,6 +46,7 @@ const targetApp = queryObject.target
 const app = targetApp.split('-')[0]
 const isSurgeiOS = targetApp == 'surge-module'
 const isStashiOS = targetApp == 'stash-stoverride'
+const stashNativeArguments = isStashiOS && supportsStashArguments(typeof $environment === 'undefined' ? {} : $environment)
 const isLooniOS = targetApp == 'loon-plugin'
 const isShadowrocket = targetApp == 'shadowrocket-module'
 
@@ -262,6 +263,8 @@ let realBox = [] //real-ip
 let useLocalHostItemForProxy = null // Surge General: use-local-host-item-for-proxy
 let hndelBox = [] //正则剔除的主机名
 let sgArg = [] //surge模块参数
+const stashArguments = new Map()
+const stashArgumentNames = new Map()
 let loonSgArg = [] //转换为 Loon 时实际需要保留的参数
 let surgeRuleToggleArgs = new Map() //Surge 用行首 # 注释控制脚本启停的参数
 let argumentKeyRenameMap = new Map() //Surge 模板参数名 -> 脚本实际读取的 $argument key
@@ -1927,25 +1930,45 @@ if (binaryInfo != null && binaryInfo.length > 0) {
       if (jsBox[i].loonV2ObjectArgument) {
         const pairs = parseSurgeTemplateArgumentPairs(jsarg)
         if (pairs.length > 0) {
-          const values = pairs.map(({ scriptKey, templateKey }) => {
+          const numericKeys = []
+          jsarg = '{' + pairs.map(({ scriptKey, templateKey }) => {
+            const key = decodeURIComponent(scriptKey)
             const item = sgArg.find(item => item.key === templateKey)
-            const raw = splitTopLevel(item?.value || '', ',')[0] || ''
-            let value = unwrapLoonV2String(raw) ?? raw.trim()
-            if (item?.type === 'switch') value = istrue(value)
-            else if (item?.valueType === 'number') value = Number(value)
-            return [decodeURIComponent(scriptKey), value]
-          })
-          // Escape template delimiters so the final legacy substitution cannot expand user data again.
-          const jsonString = value => JSON.stringify(value).replace(/\{/g, '\\u007b').replace(/\}/g, '\\u007d')
-          jsarg = '{' + values.map(([key, value]) => `${jsonString(key)}:${jsonString(value)}`).join(',') + '}'
+            const name = stashCommented ? '' : registerStashArgument(item)
+            if (!name) {
+              return `${JSON.stringify(key)}:${JSON.stringify(item ? stashArgumentDefault(item) : '')}`
+            }
+            if (item.valueType === 'number' && !stashArguments.get(name)['value-type']) numericKeys.push(key)
+            return `${escapeStashArgumentLiteral(JSON.stringify(key))}:\${args.${name}|json}`
+          }).join(',') + '}'
           jsurl = /^https?:\/\/script\.hub\/convert\//.test(jsurl)
             ? `${jsurl}&argumentFormat=loon-object`
             : `http://script.hub/convert/_start_/${jsurl}/_end_/loon-argument.js?type=loon-script&target=stash-script&argumentFormat=loon-object`
+          if (numericKeys.length) jsurl += '&argumentNumbers=' + encodeURIComponent(JSON.stringify(numericKeys))
           jsname += '-loon-object'
         }
       }
 
+      if (!stashCommented && !jsBox[i].loonV2ObjectArgument) {
+        const jsonString = stashJsonStringArgument(jsarg)
+        jsarg = jsonString || stashArgumentReferences(jsarg)
+        if (jsonString) {
+          jsurl = /^https?:\/\/script\.hub\/convert\//.test(jsurl)
+            ? `${jsurl}&argumentFormat=json-string`
+            : `http://script.hub/convert/_start_/${jsurl}/_end_/json-argument.js?type=loon-script&target=stash-script&argumentFormat=json-string`
+          jsname += '-json-string'
+        }
+      }
       cronexp = reJsValue(nCron || 'null', ncronexp, jsname, ori, cronexp)
+      if (!stashCommented) {
+        cronexp = stashArgumentReferences(cronexp)
+        if (cronexp.includes('${args.')) cronexp = JSON.stringify(stripWrapQuote(cronexp))
+      }
+      else cronexp = `${cronexp || ''}`.replace(/\{\{\{([^{}]+)\}\}\}|\{([^{}]+)\}/g, (token, triple, single) => {
+        const item = sgArg.find(item => item.key === (triple || single))
+        return item ? getArgumentDefaultValue(item) : token
+      })
+      if (!stashNativeArguments && cronexp && getTemplateKeys(jsBox[i].cronexp || '').length) cronexp = JSON.stringify(stripWrapQuote(cronexp))
 
       jsname = reJsValue(njsnametarget || 'null', njsname, jsname, ori, jsname)
 
@@ -2169,13 +2192,11 @@ ${providers}
     isSurgeiOS || isShadowrocket
       ? new Set([...body.matchAll(/\{\{\{([^{}]+)\}\}\}/g)].map(item => item[1].trim()).filter(Boolean))
       : new Set()
-  if (isStashiOS && sgArg.length > 0) {
-    body = body.replaceAll('{{{', '{').replaceAll('}}}', '}')
-    for (let i = 0; i < sgArg.length; i++) {
-      let e = '{' + sgArg[i].key + '}'
-      let r = sgArg[i].value.split(',')[0]
-      body = body.replaceAll(e, r)
-    } //for
+  if (isStashiOS) {
+    if (stashArguments.size) {
+      const schema = [...stashArguments].map(([key, value]) => `  ${key}: ${JSON.stringify(value)}`).join('\n')
+      body = `arguments-version: 1\narguments:\n${schema}\n\n${body}`
+    }
   } else if (isSurgeiOS || isShadowrocket) {
     body = body.replaceAll('{{{', '{').replaceAll('}}}', '}')
     for (let i = 0; i < sgArg.length; i++) {
@@ -3696,6 +3717,124 @@ function getTemplateKeys(str) {
     ...[...str.matchAll(/\{\{\{([^{}]+)\}\}\}/g)].map(item => item[1].trim()),
     ...[...str.replace(/\{\{\{[^{}]+\}\}\}/g, '').matchAll(/\{([^{}]+)\}/g)].map(item => item[1].trim()),
   ].filter(Boolean)
+}
+
+function supportsStashArguments(environment) {
+  // Use the converter host, never the UA used to download a source plugin.
+  const minimum = { iOS: [3, 7], tvOS: [3, 7], macOS: [4, 4] }[environment.system]
+  const version = `${environment['stash-version'] ?? ''}`.match(/^(\d+)\.(\d+)(?:\.\d+)?(?:[-+][\w.-]+)?$/)
+  return !!(minimum && version && (Number(version[1]) > minimum[0] || Number(version[1]) === minimum[0] && Number(version[2]) >= minimum[1]))
+}
+
+function escapeStashArgumentLiteral(value) {
+  return stashNativeArguments ? value.replace(/\$\{/g, () => '$${') : value
+}
+
+function stashArgumentDefault(item) {
+  const raw = splitTopLevel(`${item.value ?? ''}`, ',')[0] || ''
+  const value = unwrapLoonV2String(raw) ?? stripWrapQuote(raw.trim())
+  if (item.type === 'switch' && !(item.valueType === undefined && /^['"]/.test(`${item.value}`))) return istrue(value)
+  if (item.valueType === 'number' && Number.isFinite(Number(value))) return Number(value)
+  return value
+}
+
+function registerStashArgument(item) {
+  if (!stashNativeArguments || !item || item.noteK === '#') return ''
+  if (!stashArgumentNames.size) {
+    const used = new Set(sgArg.filter(arg => /^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(arg.key)).map(arg => arg.key))
+    for (const arg of sgArg) {
+      if (stashArgumentNames.has(arg.key)) continue
+      let name = arg.key
+      if (!/^[A-Za-z][A-Za-z0-9_]{0,63}$/.test(name)) {
+        const base = ('arg_' + name.replace(/[^A-Za-z0-9_]/g, '_')).slice(0, 56)
+        name = base
+        let suffix = 1
+        while (used.has(name)) name = base + '_' + suffix++
+      }
+      used.add(name)
+      stashArgumentNames.set(arg.key, name)
+    }
+  }
+  const name = stashArgumentNames.get(item.key)
+  if (stashArguments.has(name)) return name
+  const raw = splitTopLevel(`${item.value ?? ''}`, ',')[0] || ''
+  const value = unwrapLoonV2String(raw) ?? stripWrapQuote(raw.trim())
+  const { tag, desc } = parseArgumentTagFields(item.tag)
+  const schema = { type: item.type === 'switch' && item.valueType === undefined && /^['"]/.test(`${item.value}`) ? 'input' : item.type, title: stripWrapQuote(tag || item.key), default: value }
+  if (!['input', 'select', 'switch'].includes(schema.type)) schema.type = 'input'
+  if (desc) schema.description = stripWrapQuote(desc)
+  if (schema.type === 'switch') schema.default = istrue(value)
+  if (item.type === 'select') schema.options = [...new Set([value, ...getArgumentOptions(item)])].map(value => ({ value }))
+  if (item.valueType === 'number' && item.type === 'input') {
+    if (/^[+-]?\d+$/.test(value) && Number.isSafeInteger(Number(value))) {
+      schema['value-type'] = 'integer'
+      schema.default = Number(value)
+    } else {
+      targetCompatibilityWarnings.push(`${item.key} → Stash 仅支持整数输入；已使用文本参数，并由对象 argument wrapper 恢复数值`)
+    }
+  }
+  if (jsBox.some(script => getTemplateKeys(script.jsenable || '').includes(item.key))) {
+    schema.description = [schema.description, 'enable 仍按转换时默认值静态适配；此参数不控制脚本启停，需重新转换。'].filter(Boolean).join('\n')
+  }
+  stashArguments.set(name, schema)
+  return name
+}
+
+function stashJsonStringArgument(value) {
+  value = unwrapJsonArgument(value)
+  if (!value) return ''
+  const refs = /(?<![{$])(?:\{\{\{([^{}]+)\}\}\}|\{([^{}]+)\})/g
+  const tokens = /"(?:\\.|[^"\\])*"|(?<![{$])(?:\{\{\{[^{}]+\}\}\}|\{[^{}]+\})/g
+  const quote = text => escapeStashArgumentLiteral(JSON.stringify(text))
+  let embedded = false
+  let offset = 0
+  const parts = []
+  for (const match of value.matchAll(tokens)) {
+    const token = match[0]
+    parts.push(quote(value.slice(offset, match.index)))
+    offset = match.index + token.length
+    if (/^\s*:/.test(value.slice(offset))) { parts.push(quote(token)); continue }
+    const quoted = token.startsWith('"')
+    const text = quoted ? JSON.parse(token) : token
+    const segments = []
+    let end = 0
+    for (const ref of text.matchAll(refs)) {
+      const item = sgArg.find(item => item.key === (ref[1] || ref[2]))
+      if (!item) continue
+      const name = registerStashArgument(item)
+      segments.push(quote(text.slice(end, ref.index)))
+      segments.push(name ? `\${args.${name}|json}` : quote(stashArgumentDefault(item)))
+      end = ref.index + ref[0].length
+      if (quoted && ref[0] !== text) embedded = true
+    }
+    if (!segments.length) { parts.push(quote(token)); continue }
+    segments.push(quote(text.slice(end)))
+    parts.push(`[${quote(quoted && !/^(?:\{\{\{[^{}]+\}\}\}|\{[^{}]+\})$/.test(text) ? 'string' : 'json')},${segments.join(',')}]`)
+  }
+  parts.push(quote(value.slice(offset)))
+  return embedded ? `[${parts.join(',')}]` : ''
+}
+
+function stashArgumentReferences(value) {
+  if (/^\s*\{/.test(value || '')) value = unwrapJsonArgument(value) || value
+  const json = /^\s*\{[\s\S]*:/.test(value || '')
+  value = escapeStashArgumentLiteral(`${value ?? ''}`)
+  const tokens = json
+    ? /"(?:\\.|[^"\\])*"|(?<![{$])(?:\{\{\{[^{}]+\}\}\}|\{[^{}]+\})/g
+    : /(?<![{$])(?:\{\{\{[^{}]+\}\}\}|\{[^{}]+\})/g
+  return value.replace(tokens, (token, offset) => {
+    if (json && /^\s*:/.test(value.slice(offset + token.length))) return token
+    const ref = token.startsWith('"') ? token.slice(1, -1) : token
+    const key = ref.match(/^(?:\{\{\{([^{}]+)\}\}\}|\{([^{}]+)\})$/)
+    if (!key) return token
+    const item = sgArg.find(item => item.key === (key[1] || key[2]))
+    const name = registerStashArgument(item)
+    if (item && !name) {
+      const fallback = stashArgumentDefault(item)
+      return escapeStashArgumentLiteral(json ? JSON.stringify(fallback) : String(fallback))
+    }
+    return name ? `\${args.${name}${json ? '|json' : ''}}` : token
+  })
 }
 
 function getArgumentDefaultValue(item) {
