@@ -96,6 +96,67 @@ function sectionLines(body, sectionName) {
     .filter(line => line && !line.startsWith('#'))
 }
 
+test('redirect candidates reject prose while retaining commented rules and keyword controls', async () => {
+  const source = '# The default header entry does not pass full to avoid reading the body by mistake.\n#^https://example.com/old https://example.com/new 302\n^https://example.com/live url 307 https://example.com/next'
+  for (const target of ['stash-stoverride', 'surge-module', 'shadowrocket-module', 'loon-plugin']) {
+    const kept = await convert(source, target, {}, 'loon-plugin', { del: 'false' })
+    assert.doesNotMatch(kept.body, /undefined|TypeError/)
+    assert.match(kept.body, /example.com\/old/)
+    const removed = await convert(source, target, {}, 'loon-plugin', { del: 'true' })
+    assert.doesNotMatch(removed.body, /example.com\/old/)
+  }
+  const activated = await convert(source, 'stash-stoverride', {}, 'loon-plugin', { del: 'false', y: 'example.com/old' })
+  assert.match(activated.body, /\n    - >-\n      \^https:\/\/example.com\/old/)
+  const excluded = await convert(source, 'stash-stoverride', {}, 'loon-plugin', { del: 'false', x: 'example.com/live' })
+  assert.match(excluded.body, /#      \^https:\/\/example.com\/live/)
+  const youtube = await convert(fs.readFileSync(path.join(__dirname, 'fixtures/youtube.lpx'), 'utf8'), 'stash-stoverride')
+  assert.match(youtube.body, /http:/)
+  assert.doesNotMatch(youtube.body, /TypeError/)
+})
+
+test('Stash resolves legacy and v2 enable using Boolean defaults and disables unknown values', async () => {
+  for (const syntax of ['legacy', 'v2']) {
+    const declarations = '[Argument]\non=switch,true,false\noff=switch,false,true\ntext=select,"true","false"\ncount=input,1,type=number\n[Script]\n'
+    const rules = ['on', 'off', 'missing', 'text', 'count'].map(key => syntax === 'legacy'
+      ? `http-response /${key}/ script-path=https://example.com/${key}.js,enable={${key}}`
+      : `response if \${url} ~= /${key}/ then script("https://example.com/${key}.js") with enable=\${${key}}`).join('\n')
+    const { body, notifications } = await convert(declarations + rules, 'stash-stoverride')
+    assert.match(body, /\n    - match: \/?on\/?\n/)
+    assert.match(body, /url: https:\/\/example.com\/on.js/)
+    for (const key of ['off', 'missing', 'text', 'count']) assert.ok(!body.includes(`url: https://example.com/${key}.js`))
+    assert.match(JSON.stringify(notifications), /默认值|default/)
+    assert.match(JSON.stringify(notifications), /无法|未知/)
+  }
+  const spotify = await convert(fs.readFileSync(path.join(__dirname, 'fixtures/spotify.lpx'), 'utf8'), 'stash-stoverride')
+  assert.match(spotify.body, /url: .*spot-proto-ev3.js/)
+  assert.doesNotMatch(spotify.body, /url: .*spot-proto-eevee.js/)
+})
+
+test('legacy Loon argument lists reuse typed object wrappers and preserve native strings', async () => {
+  const source = '[Argument]\nflag=switch,false\nliteral=select,"false","true"\ncount=input,9.5,type=number\n[Script]\nhttp-request /object/ script-path=https://example.com/shared.js,argument=[{flag},{literal},{count}]\nhttp-request /plain/ script-path=https://example.com/shared.js,argument="native string"'
+  const { body } = await convert(source, 'stash-stoverride')
+  assert.match(body, /argumentFormat=loon-object/)
+  assert.match(body, /\{"flag":false,"literal":"false","count":9.5\}/)
+  assert.match(body, /argument: \|-\n\s+native string/)
+  assert.equal((body.match(/url: https:\/\/example.com\/shared.js/g) || []).length, 1)
+  assert.equal(new Set([...body.matchAll(/name: "([^"]+)"/g)].map(m => m[1])).size, 2)
+  const providerUrl = body.match(/url: (http:\/\/script\.hub\/convert\/[^\n]+)/)[1].trim()
+  const converter = fs.readFileSync(path.join(__dirname, '..', 'script-converter.beta.js'), 'utf8')
+  const wrapped = await convert('', '', { 'https://example.com/shared.js': '$done({body: JSON.stringify($argument)})' }, 'loon-plugin', {}, { parser: converter, requestUrl: providerUrl })
+  let result
+  vm.runInNewContext(wrapped.body, { $argument: body.match(/argument: \|-\n\s+([^\n]+)/)[1], $done: value => { result = value } })
+  assert.deepEqual(JSON.parse(result.body), { flag: false, literal: 'false', count: 9.5 })
+})
+
+test('YouTube legacy Generic icon is extracted without a field prefix', async () => {
+  const source = fs.readFileSync(path.join(__dirname, 'fixtures/youtube.lpx'), 'utf8')
+  const { body } = await convert(source, 'loon-plugin')
+  assert.match(body, /img_url="person.crop.circle.badge.xmark.system"/)
+  assert.doesNotMatch(body, /img_url="[, ]*img-url=/)
+  const trailing = await convert('generic script-path=https://example.com/a.js,img-url=person.system,timeout=10,tag=Tile', 'loon-plugin')
+  assert.match(trailing.body, /img_url="person.system"/)
+})
+
 test('native Rewrite actions use the supported target matrix without losing rules', async () => {
   const source = [
     'request if ${url} ~= /move/ then redirect(302, "https://example.com/new")',

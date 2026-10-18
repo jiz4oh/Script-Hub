@@ -663,7 +663,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
     }
 
     //重定向 解析
-    if (/(?:\s(?:302|307|header)(?:$|\s)|url\s+30(?:2|7)\s)/.test(x)) {
+    if (/^#?\S+\s+(?:\S+\s+(?:302|307|header)|(?:302|307|header)\s+\S+|url\s+(?:302|307|header)\s+\S+)$/.test(x)) {
       mark = getMark(y, body)
       rw_redirect(x, mark)
     }
@@ -937,7 +937,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
         : /,\s*tag\s*=\s*/.test(x)
           ? getJsInfo(x, /,\s*tag\s*=\s*/)
           : jsurl.substring(jsurl.lastIndexOf('/') + 1, jsurl.lastIndexOf('.'))
-      img = getJsInfo(x, /[,\s]\s*img-url\s*=\s*/)
+      img = getJsInfo(x, /[,\s]\s*img-url\s*=\s*/, jsRegex)
       jsfrom = 'surge'
       jsurl = toJsc(jsurl, jscStatus, jsc2Status, jsfrom)
       jstype = /[=,]\s*type\s*=\s*/.test(x) ? getJsInfo(x, /[=,]\s*type\s*=\s*/) : x.split(/\s+/)[0].replace(/^#/, '')
@@ -949,6 +949,10 @@ if (binaryInfo != null && binaryInfo.length > 0) {
         : x.split(/\s+/)[1]
       jsptn = /cron|event|network-changed|generic|dns|rule/i.test(jstype) ? '' : jsptn
       jsarg = getJsInfo(x, /[=,\s]\s*argument\s*=\s*/)
+      if (isStashiOS && getLoonArgumentKeys(jsarg).length > 0) {
+        loonV2ObjectArgument = true
+        jsarg = getLoonArgumentKeys(jsarg).map(key => `${encodeURIComponent(key)}={${key}}`).join('&')
+      }
       rebody = getJsInfo(x, /[=,\s]\s*requires-body\s*=\s*/)
       wakesys = getJsInfo(x, /[=,\s]\s*wake-system\s*=\s*/)
       cronexp = /cronexpr?\s*=\s*/.test(x)
@@ -1668,7 +1672,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
       if (/,/.test(jsptn) && isSurgeiOS) jsptn = '"' + jsptn + '"'
       if ((isSurgeiOS || isShadowrocket) && jsptn != '') jsptn = ', pattern=' + jsptn
       jsname = jsBox[i].jsname
-      img = jsBox[i].img ? ', img-url=' + jsBox[i].img : ''
+      img = jsBox[i].img || ''
       eventname = jsBox[i].eventname ? ', event-name=' + jsBox[i].eventname : ', event-name=network-changed'
       jstype =
         isLooniOS && /event/.test(jstype)
@@ -1874,8 +1878,17 @@ if (binaryInfo != null && binaryInfo.length > 0) {
 
     for (let i = 0; i < jsBox.length; i++) {
       const stashEnable = `${jsBox[i].jsenable ?? ''}`.trim()
-      const stashDynamicEnable = jsBox[i].loonV2 && stashEnable && !/^(true|false)$/i.test(stashEnable)
-      const stashDisabled = /^(false|0|off|no)$/i.test(stashEnable) || stashDynamicEnable
+      let stashDisabled = /^(false|0|off|no)$/i.test(stashEnable)
+      if (stashEnable && !/^(true|false|0|1|off|on|no|yes)$/i.test(stashEnable)) {
+        const key = stashEnable.match(/^\{(?:\{\{)?([^{}]+)\}(?:\}\})?$/)?.[1]
+        const item = sgArg.find(item => item.key === key)
+        const value = getArgumentDefaultValue(item)
+        const known = item?.type === 'switch' && /^(true|false)$/i.test(value)
+        stashDisabled = !known || /^false$/i.test(value)
+        targetCompatibilityWarnings.push(known
+          ? `${jsBox[i].ori} → Stash 不支持动态 enable，已按 Boolean 默认值 ${value} 静态适配；修改参数后需重新转换`
+          : `${jsBox[i].ori} → Stash enable 无法解析为 Boolean 默认值，已保守禁用脚本`)
+      }
       const stashCommented = jsBox[i].noteK == '#' || stashDisabled
       if (!stashCommented) {
         noteKn8 = '\n        '
@@ -2710,9 +2723,7 @@ function normalizeLoonV2ScriptLine(line, targetApp) {
       const enable = normalizeLoonV2Boolean(value, targetApp)
       if (enable == null) return { unsupported: true, reason: 'enable 必须是 Boolean 或动态 Boolean 参数' }
       legacyOptions.push(`enable=${enable}`)
-      if (targetApp === 'stash-stoverride' && !/^(true|false)$/i.test(enable)) {
-        warnings.push('Stash 不支持动态 enable，已将对应脚本转换为注释')
-      } else if (targetApp === 'stash-stoverride' && enable === 'false') {
+      if (targetApp === 'stash-stoverride' && enable === 'false') {
         warnings.push('Stash 不支持 enable=false，已将对应脚本转换为注释')
       }
     } else if (key === 'debug') {
@@ -4602,6 +4613,7 @@ function rw_reject(x, mark) {
 
 //重定向
 function rw_redirect(x, mark) {
+  if (!/^#?\S+\s+(?:\S+\s+(?:302|307|header)|(?:302|307|header)\s+\S+|url\s+(?:302|307|header)\s+\S+)$/.test(x)) return
   let noteK = isNoteK(x)
   x = x.replace(/\s{2,}/g, ' ')
   let redirect_type = x.match(/\s302|\s307|\sheader\s|\sheader$/)[0].replace(/\s/g, '')
@@ -4620,12 +4632,12 @@ function rw_redirect(x, mark) {
     rwtype = xArr[1]
   }
 
-  if (rw_typeInNum == '2' && xArr.length == 4) {
+  if (rw_typeInNum == '2' && xArr.length == 4 && xArr[1] === 'url') {
     rwptn = xArr[0].replace(/^#/, '').replace(/^"(.+)"$/, '$1')
     rwvalue = xArr[3]
     rwtype = xArr[2]
   }
-  rwBox.push({ mark, noteK, rwptn, rwvalue, rwtype })
+  if (rwptn && rwvalue && rwtype) rwBox.push({ mark, noteK, rwptn, rwvalue, rwtype })
 }
 
 //script
