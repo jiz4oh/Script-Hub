@@ -1340,7 +1340,7 @@ if (binaryInfo != null && binaryInfo.length > 0) {
     if (/reject-(?:dict|array|img)/i.test(rulepolicy) && isSurgeiOS) {
       rulepolicy = 'REJECT-TINYGIF'
     }
-    if (/reject-/i.test(rulepolicy) && !/url-regex/i.test(ruletype) && isStashiOS) {
+    if (/reject-/i.test(rulepolicy) && !/^REJECT-DROP$/i.test(rulepolicy) && !/url-regex/i.test(ruletype) && isStashiOS) {
       rulepolicy = 'REJECT'
     }
     if (/reject-[^-]+-no-drop/i.test(rulepolicy) && !isLooniOS) {
@@ -1393,6 +1393,8 @@ if (binaryInfo != null && binaryInfo.length > 0) {
       isSurgeiOS
     ) {
       rules.push(mark + noteK + ruletype + ',' + rulevalue + ',' + rulepolicy + rulepm)
+    } else if (/^url-regex$/i.test(ruletype) && isStashiOS && /^(REJECT(-DROP)?|DIRECT|PROXY)$/i.test(rulepolicy)) {
+      rules.push(mark + noteK2 + '- ' + ruletype + ',' + rulevalue + ',' + rulepolicy + rulenore)
     } else if (/url-regex/i.test(ruletype) && isStashiOS && /reject/i.test(rulepolicy)) {
       let Urx2Reject
       if (/DICT/i.test(rulepolicy)) {

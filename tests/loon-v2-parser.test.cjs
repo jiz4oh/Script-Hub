@@ -306,6 +306,33 @@ test('Stash restores typed Loon objects through the converter without putting va
   assert.equal((mixed.body.match(/url: https:\/\/example.com\/object.js/g) || []).length, 1)
 })
 
+test('beta Stash preserves DROP routing and keeps ordinary REJECT and response rewrites distinct', async () => {
+  const source = [
+    '[Rule]',
+    'DOMAIN,drop.example,REJECT-DROP',
+    'DOMAIN,plain.example,REJECT',
+    'DOMAIN,img.example,REJECT-IMG',
+    'IP-CIDR,192.0.2.0/24,REJECT-DROP,no-resolve',
+    'URL-REGEX,^https://drop.example/,REJECT-DROP',
+    'URL-REGEX,^https://plain.example/,REJECT',
+    'URL-REGEX,^https://direct.example/,DIRECT',
+    'URL-REGEX,^https://dict.example/,REJECT-DICT',
+    '# DOMAIN,comment.example,REJECT-DROP',
+    'AND,((DOMAIN,logical.example),(DST-PORT,443)),REJECT-DROP',
+    'UNKNOWN-TYPE,unknown.example,REJECT-DROP',
+  ].join('\n')
+  for (const filename of ['Rewrite-Parser.beta.js']) {
+    const runtime = { parser: fs.readFileSync(path.join(__dirname, '..', filename), 'utf8') }
+    const { body, notifications } = await convert(source, 'stash-stoverride', {}, 'loon-plugin', { del: 'false' }, runtime)
+    for (const rule of ['DOMAIN,drop.example,REJECT-DROP', 'DOMAIN,plain.example,REJECT', 'DOMAIN,img.example,REJECT', 'IP-CIDR,192.0.2.0/24,REJECT-DROP,no-resolve', 'URL-REGEX,^https://drop.example/,REJECT-DROP', 'URL-REGEX,^https://plain.example/,REJECT', 'URL-REGEX,^https://direct.example/,DIRECT', 'AND,((DOMAIN,logical.example),(DST-PORT,443)),REJECT-DROP']) assert.ok(body.includes('- ' + rule), `${filename}: ${rule}`)
+    assert.match(body, /#\s+- DOMAIN,comment\.example,REJECT-DROP/)
+    assert.match(body, /https:\/\/dict\.example\/ - reject-dict/)
+    assert.doesNotMatch(body, /https:\/\/(drop|plain)\.example\/ - reject/)
+    assert.doesNotMatch(body, /- UNKNOWN-TYPE,/)
+    assert.doesNotMatch(body, /UNKNOWN-TYPE,unknown\.example,REJECT(?:,|\n)/)
+  }
+})
+
 test('real HTTPDNS source preserves all four top-level USER-AGENT and logical rules', async () => {
   const source = fs.readFileSync(path.join(__dirname, 'fixtures', 'block_httpdns.lpx'), 'utf8')
   const { body, notifications } = await convert(source, 'stash-stoverride')
