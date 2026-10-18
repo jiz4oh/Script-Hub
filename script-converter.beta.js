@@ -360,6 +360,9 @@ global.$done = _scriptSonverterDone
   if (evUrlori) {
     eval($.lodash_get(await http(evUrlori, { ...reqHeaders }), 'body'))
   }
+  if (queryObject.argumentFormat === 'loon-object') {
+    body = `$argument = JSON.parse($argument);\n${body}`
+  }
   if (type === 'qx-script' || compatibilityOnly) {
     const content = `${prefix}\n${compatibilityOnly ? body : body.replace(/\$done\(/g, '_scriptSonverterDone(')}`
     body = `const _scriptSonverterCompatibilityType = typeof $response !== 'undefined' ? 'response' : typeof $request !== 'undefined' ? 'request' : ''

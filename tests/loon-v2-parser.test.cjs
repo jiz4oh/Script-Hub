@@ -48,7 +48,7 @@ async function convert(source, target, httpBodies = {}, sourceType = 'loon-plugi
     isFinite,
     setTimeout,
     clearTimeout,
-    $request: { url: requestUrl, method: 'GET', headers: {} },
+    $request: { url: runtime.requestUrl || requestUrl, method: 'GET', headers: {} },
     $response: { body: '' },
     $done: value => {
       doneValue = value
@@ -236,12 +236,10 @@ test('body regex arguments preserve commas, quotes, classes, escapes, and paired
 test('real Tieba object argument retains its key and enables the downstream video option', async () => {
   const source = fs.readFileSync(path.join(__dirname, 'fixtures', 'tieba_remove_ads.lpx'), 'utf8')
   const stash = await convert(source, 'stash-stoverride')
-  const argument = [...stash.body.matchAll(/argument: \|-\n\s+([^\n]+)/g)].map(match => match[1]).find(value => value.startsWith('per_filter_video_thread='))
-  const options = Object.fromEntries(argument.split('&').map(item => {
-    const [key, value] = item.split('=')
-    return [key, value === 'true' ? true : value === 'false' ? false : value]
-  }))
-  assert.equal(options.per_filter_video_thread, true)
+  const argument = [...stash.body.matchAll(/argument: \|-\n\s+([^\n]+)/g)].map(match => match[1]).find(value => value.startsWith('{"per_filter_video_thread"'))
+  const options = JSON.parse(argument)
+  assert.equal(options.per_filter_video_thread, 'true')
+  assert.match(stash.body, /argumentFormat=loon-object/)
   assert.doesNotMatch(JSON.stringify(stash.notifications), /不支持以下内容/)
   for (const target of ['surge-module', 'shadowrocket-module']) {
     const { body } = await convert(source, target)
@@ -262,10 +260,50 @@ test('Stash encodes object defaults without changing literal string arguments', 
   ].join('\n')
   const { body, notifications } = await convert(source, 'stash-stoverride')
   const args = [...body.matchAll(/argument: \|-\n\s+([^\n]+)/g)].map(match => match[1])
-  assert.equal(args[0], `first=${encodeURIComponent('a&b=c%20, d')}&second=${encodeURIComponent('引号"/空 格')}`)
-  assert.equal(new URLSearchParams(args[0]).get('first'), 'a&b=c%20, d')
+  assert.deepEqual(JSON.parse(args[0]), { first: 'a&b=c%20, d', second: '引号"/空 格' })
   assert.equal(args[1], 'first=literal&second=x')
   assert.doesNotMatch(JSON.stringify(notifications), /不支持以下内容/)
+})
+
+test('Stash restores typed Loon objects through the converter without putting values in provider URLs', async () => {
+  const source = [
+    '[Argument]',
+    'token=input, "a&b=c%20,{flag}", tag=Token',
+    'flag=switch,false,tag=Flag',
+    'count=input,9.5,type=number,tag=Count',
+    'literal=select,"false","true",tag=Literal',
+    '__proto__=input,"own",tag=Prototype',
+    '任意.key=input,"a&b=c%20,+",tag=Unicode',
+    '[Script]',
+    'request if ${url} ~= /object/ then script("https://example.com/object.js", {${token}, ${flag}, ${count}, ${literal}, ${__proto__}, ${任意.key}})',
+  ].join('\n')
+  const { body } = await convert(source, 'stash-stoverride')
+  const argument = body.match(/argument: \|-\n\s+([^\n]+)/)[1]
+  const providerUrl = body.match(/url: (http:\/\/script\.hub\/convert\/[^\n]+)/)[1].trim()
+  assert.ok(!providerUrl.includes('a&b') && !providerUrl.includes('token'))
+  const converter = fs.readFileSync(path.join(__dirname, '..', 'script-converter.beta.js'), 'utf8')
+  const synthetic = `
+    if ($argument.flag !== false || typeof $argument.flag !== 'boolean') throw new Error('switch type lost');
+    if ($argument.literal !== 'false' || typeof $argument.literal !== 'string') throw new Error('select type lost');
+    const parsed = typeof $argument === 'string' ? JSON.parse($argument) : $argument;
+    if (parsed.flag !== false || parsed.literal !== 'false') throw new Error('JSON consumer contract lost');
+    $done({ body: JSON.stringify(parsed) });`
+  const wrapped = await convert('', '', { 'https://example.com/object.js': synthetic }, 'loon-plugin', {}, {
+    parser: converter, requestUrl: providerUrl,
+  })
+  new vm.Script(wrapped.body)
+  let result
+  vm.runInNewContext(wrapped.body, { $argument: argument, $done: value => { result = value } })
+  assert.deepEqual(JSON.parse(result.body), JSON.parse('{"token":"a&b=c%20,{flag}","flag":false,"count":9.5,"literal":"false","__proto__":"own","任意.key":"a&b=c%20,+"}'))
+  assert.throws(() => vm.runInNewContext(wrapped.body, { $argument: 'broken', $done: () => assert.fail('malformed argument reached script') }))
+  const enabled = await convert(source, 'stash-stoverride', {}, 'loon-plugin', { jsc: 'true' })
+  const enabledUrl = enabled.body.match(/url: (http:\/\/script\.hub\/convert\/[^\n]+)/)[1]
+  assert.equal((enabledUrl.match(/convert\/_start_/g) || []).length, 1)
+  assert.match(enabledUrl, /argumentFormat=loon-object/)
+  const mixed = await convert(source + '\nrequest if ${url} ~= /plain/ then script("https://example.com/object.js")', 'stash-stoverride')
+  const names = [...mixed.body.matchAll(/name: "([^"]+)"/g)].map(match => match[1])
+  assert.equal(new Set(names).size, 2)
+  assert.equal((mixed.body.match(/url: https:\/\/example.com\/object.js/g) || []).length, 1)
 })
 
 test('real HTTPDNS source preserves all four top-level USER-AGENT and logical rules', async () => {

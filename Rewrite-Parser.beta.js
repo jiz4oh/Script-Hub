@@ -1912,11 +1912,21 @@ if (binaryInfo != null && binaryInfo.length > 0) {
       if (jsBox[i].loonV2ObjectArgument) {
         const pairs = parseSurgeTemplateArgumentPairs(jsarg)
         if (pairs.length > 0) {
-          jsarg = pairs.map(({ scriptKey, templateKey }) => {
+          const values = pairs.map(({ scriptKey, templateKey }) => {
             const item = sgArg.find(item => item.key === templateKey)
-            const value = unwrapLoonV2String(splitTopLevel(item?.value || '', ',')[0]) ?? getArgumentDefaultValue(item)
-            return `${scriptKey}=${encodeURIComponent(value)}`
-          }).join('&')
+            const raw = splitTopLevel(item?.value || '', ',')[0] || ''
+            let value = unwrapLoonV2String(raw) ?? raw.trim()
+            if (item?.type === 'switch') value = istrue(value)
+            else if (item?.valueType === 'number') value = Number(value)
+            return [decodeURIComponent(scriptKey), value]
+          })
+          // Escape template delimiters so the final legacy substitution cannot expand user data again.
+          const jsonString = value => JSON.stringify(value).replace(/\{/g, '\\u007b').replace(/\}/g, '\\u007d')
+          jsarg = '{' + values.map(([key, value]) => `${jsonString(key)}:${jsonString(value)}`).join(',') + '}'
+          jsurl = /^https?:\/\/script\.hub\/convert\//.test(jsurl)
+            ? `${jsurl}&argumentFormat=loon-object`
+            : `http://script.hub/convert/_start_/${jsurl}/_end_/loon-argument.js?type=loon-script&target=stash-script&argumentFormat=loon-object`
+          jsname += '-loon-object'
         }
       }
 
@@ -5048,13 +5058,14 @@ function parseArguments(str, noteK = '') {
     const key = rawKey.trim()
     const type = `${parts.shift() || ''}`.trim()
     const tagIndex = parts.findIndex(item => /^\s*(?:tag|desc)\s*=/.test(item))
-    const valueParts = tagIndex === -1 ? parts : parts.slice(0, tagIndex)
+    const valueParts = (tagIndex === -1 ? parts : parts.slice(0, tagIndex)).filter(part => !/^\s*type\s*=/i.test(part))
     const tagParts = tagIndex === -1 ? [] : parts.slice(tagIndex)
     const value = type == 'select' ? valueParts[0] : valueParts.join(',')
     const options = normalizeArgumentOptions(valueParts)
     const tag = tagParts.join(', ') || `tag=${key}, desc=${key}`
 
-    sgArg.push({ key, value, type, options, tag, noteK })
+    const valueType = parts.some(part => /^\s*type\s*=\s*number\s*$/i.test(part)) ? 'number' : 'string'
+    sgArg.push({ key, value, type, valueType, options, tag, noteK })
 
     if (stripWrapQuote(value) == 'hostname') {
       hn2 = true
